@@ -1,39 +1,30 @@
-all: finalServer finalClient
+all:
+	make server
+	make client
 
-# ======== Server Build ========
+# ======== Server ========
 
-finalServer: finalServer.o diffieHellman.o xor.o socket.o selector.o
-	g++ -o finalServer finalServer.o diffieHellman.o xor.o socket.o selector.o
+server: server.o dh.o xor.o
+	g++ -o server server.o dh.o xor.o
 
-finalServer.o: finalServer.cc finalPacket.h diffieHellman.h xor.h socket.h selector.h
-	g++ -c finalServer.cc
+server.o: server.cc packet.h dh.h xor.h
+	g++ -c server.cc
 
-# ======== Client Build ========
+# ======== Client ========
 
-finalClient: finalClient.o diffieHellman.o xor.o socket.o
-	g++ -o finalClient finalClient.o diffieHellman.o xor.o socket.o
+client: client.o dh.o xor.o
+	g++ -o client client.o dh.o xor.o
 
-finalClient.o: finalClient.cc finalPacket.h diffieHellman.h xor.h socket.h
-	g++ -c finalClient.cc
+client.o: client.cc packet.h dh.h xor.h
+	g++ -c client.cc
 
 # ======== Crypto Modules ========
 
-diffieHellman.o: diffieHellman.cc diffieHellman.h
-	g++ -c diffieHellman.cc
+dh.o: dh.cc dh.h
+	g++ -c dh.cc
 
 xor.o: xor.cc xor.h
 	g++ -c xor.cc
 
-# ======== Helper Modules ========
-
-socket.o: socket.cc socket.h
-	g++ -c socket.cc
-
-selector.o: selector.cc selector.h
-	g++ -c selector.cc
-
-# ======== Clean ========
-
 clean:
-	rm -f *.o finalServer finalClient
-```
+	rm -f *.o server client
