@@ -51,7 +51,11 @@ void do_handshake() {
 
     // Wait for server response
     Packet resp;
-    sock.recv(&resp, sizeof(Packet));
+    int n = sock.recv(&resp, sizeof(Packet));
+    if (n <= 0) {
+        printf("Server disconnected during handshake.\n");
+        exit(1);
+    }
     
     unsigned long long server_pub = strtoull(resp.message, NULL, 10);
     shared_key = dh_compute_shared(server_pub, priv);
@@ -60,16 +64,19 @@ void do_handshake() {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <port>\n", argv[0]);
+    if (argc < 3) {
+        printf("Usage: %s <ip> <port>\n", argv[0]);
         exit(1);
     }
 
-    int port = atoi(argv[1]);
+    const char *ip = argv[1];
+    int port = atoi(argv[2]);
 
-    // Connect to localhost
-    if (!sock.connect("127.0.0.1", port)) {
-        printf("Could not connect to localhost:%d\n", port);
+    printf("[Client] Connecting to %s:%d...\n", ip, port);
+
+    // Connect using provided IP and Port
+    if (!sock.connect(ip, port)) {
+        printf("Could not connect to %s:%d\n", ip, port);
         exit(1);
     }
 
