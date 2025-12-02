@@ -10,279 +10,155 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <pthread.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-
+#include <iostream>
+#include "socket.h"
 #include "finalPacket.h"
 #include "diffieHellman.h"
 #include "xor.h"
 
-/* ======== Raw blocking I/O ======== */
+// Global Socket Wrapper
+Socket sock;
+unsigned long long shared_key = 0;
+int current_room_id = -1;
 
-ssize_t send_all(int fd, const void *buf, size_t len) {
-    const char *p = (const char*) buf;
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, p + sent, len - sent, 0);
-        if (n <= 0) return -1;
-        sent += n;
-    }
-    return sent;
-}
-
-ssize_t recv_all(int fd, void *buf, size_t len) {
-    char *p = (char*) buf;
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = recv(fd, p + got, len - got, 0);
-        if (n <= 0) return -1;
-        got += n;
-    }
-    return got;
-}
-
-/* ======== Encrypted Packet Send/Recv ======== */
-
-int send_packet_enc(int fd, Packet *p, unsigned long long key) {
+// Helper: Send Encrypted
+void send_enc(Packet *p) {
     Packet tmp;
     memcpy(&tmp, p, sizeof(Packet));
-    xor_buffer((char*)&tmp, sizeof(Packet), key);
-    return send_all(fd, &tmp, sizeof(Packet)) == sizeof(Packet);
+    xor_buffer(tmp.message, MSG_SIZE, shared_key);
+    sock.send(&tmp, sizeof(Packet));
 }
 
-int recv_packet_enc(int fd, Packet *out, unsigned long long key) {
-    Packet tmp;
-    if (recv_all(fd, &tmp, sizeof(Packet)) != sizeof(Packet))
-        return 0;
-    xor_buffer((char*)&tmp, sizeof(Packet), key);
-    memcpy(out, &tmp, sizeof(Packet));
-    return 1;
+// Helper: Receive Encrypted (Blocking)
+bool recv_enc(Packet *p) {
+    int n = sock.recv(p, sizeof(Packet));
+    if (n <= 0) return false;
+    xor_buffer(p->message, MSG_SIZE, shared_key);
+    return true;
 }
 
-/* ========== Globals ========== */
-
-int g_sock = -1;
-unsigned long long g_shared_key = 0;
-
-/* Thread that receives async updates from server */
-void *recv_thread(void *arg) {
-    (void)arg;
-
-    while (1) {
-        Packet p;
-        if (!recv_packet_enc(g_sock, &p, g_shared_key)) {
-            printf("[client] Disconnected from server.\n");
-            exit(0);
-        }
-
-        if (p.op == OP_ROOM_UPDATE) {
-            printf("\n[Room %d] New Note (ID %d): %s\n> ",
-                p.room_id, p.tag, p.message);
-            fflush(stdout);
-        }
-        else if (p.op == OP_LIST_NOTES_RESP) {
-            if (p.tag == 0) {
-                printf("[End of Notes]\n");
-            } else {
-                printf("Note %d: %s\n", p.tag, p.message);
-            }
-        }
-        else if (p.op == OP_ERROR) {
-            printf("[ERROR] %s\n> ", p.message);
-            fflush(stdout);
-        }
-        else {
-            /* ignore other OPs */
-        }
-    }
-    return NULL;
-}
-
-/* ========== Diffie-Hellman Handshake ========== */
-
-int do_dh_handshake() {
+void do_handshake() {
     unsigned long long priv = dh_generate_private();
     unsigned long long pub = dh_compute_public(priv);
 
-    /* Send client public value (plaintext) */
-    Packet init;
-    memset(&init, 0, sizeof(init));
-    init.op = OP_DH_PUB;
-    snprintf(init.message, MSG_SIZE, "%llu", pub);
+    Packet p;
+    memset(&p, 0, sizeof(p));
+    p.op = OP_DH_PUB;
+    sprintf(p.message, "%llu", pub);
+    
+    // Send public key (unencrypted)
+    sock.send(&p, sizeof(Packet));
 
-    if (send_all(g_sock, &init, sizeof(init)) != sizeof(init))
-        return 0;
-
-    /* Receive server public value */
+    // Wait for server response
     Packet resp;
-    if (recv_all(g_sock, &resp, sizeof(resp)) != sizeof(resp))
-        return 0;
-
-    if (resp.op != OP_DH_PUB)
-        return 0;
-
+    sock.recv(&resp, sizeof(Packet));
+    
     unsigned long long server_pub = strtoull(resp.message, NULL, 10);
-    g_shared_key = dh_compute_shared(server_pub, priv);
-
-    printf("[client] Shared key established: %llu\n", g_shared_key);
-    return 1;
+    shared_key = dh_compute_shared(server_pub, priv);
+    
+    printf("[Client] Secure Connection Established. Key: %llu\n", shared_key);
 }
-
-/* ========== Menu Helpers ========== */
-
-void send_create_room() {
-    Packet p;
-    memset(&p, 0, sizeof(p));
-    p.op = OP_CREATE_ROOM;
-
-    send_packet_enc(g_sock, &p, g_shared_key);
-
-    printf("Waiting for server response...\n");
-
-    Packet resp;
-    if (!recv_packet_enc(g_sock, &resp, g_shared_key)) return;
-
-    if (resp.op == OP_CREATE_ROOM_RESP) {
-        printf("\n[Room Created]\n");
-        printf("Room ID: %d\n", resp.room_id);
-        printf("Invite Code: %d\n", resp.tag);
-        printf("Room Key: %s\n\n", resp.message);
-    }
-}
-
-void send_join_room() {
-    int invite;
-    printf("Enter invite code: ");
-    scanf("%d", &invite);
-    getchar();
-
-    Packet p;
-    memset(&p, 0, sizeof(p));
-    p.op = OP_JOIN_ROOM;
-    p.tag = invite;
-
-    send_packet_enc(g_sock, &p, g_shared_key);
-
-    Packet r;
-    if (!recv_packet_enc(g_sock, &r, g_shared_key)) return;
-
-    if (r.op == OP_JOIN_ROOM_RESP) {
-        printf("\n[Joined Room]\n");
-        printf("Room ID: %d\n", r.room_id);
-        printf("Invite Code: %d\n", r.tag);
-        printf("Room Key: %s\n\n", r.message);
-    } else if (r.op == OP_ERROR) {
-        printf("[ERROR] %s\n", r.message);
-    }
-}
-
-void send_post_note() {
-    int room_id;
-    printf("Enter room ID: ");
-    scanf("%d", &room_id);
-    getchar();
-
-    char msg[MSG_SIZE];
-    printf("Enter note text: ");
-    fgets(msg, MSG_SIZE, stdin);
-    msg[strcspn(msg, "\n")] = 0;
-
-    Packet p;
-    memset(&p, 0, sizeof(p));
-    p.op = OP_POST_NOTE;
-    p.room_id = room_id;
-    strncpy(p.message, msg, MSG_SIZE);
-
-    send_packet_enc(g_sock, &p, g_shared_key);
-}
-
-void send_list_notes() {
-    int rid;
-    printf("Enter room ID: ");
-    scanf("%d", &rid);
-    getchar();
-
-    Packet p;
-    memset(&p, 0, sizeof(p));
-    p.op = OP_LIST_NOTES;
-    p.room_id = rid;
-
-    send_packet_enc(g_sock, &p, g_shared_key);
-}
-
-void send_disconnect() {
-    Packet p;
-    memset(&p, 0, sizeof(p));
-    p.op = OP_DISCONNECT;
-    send_packet_enc(g_sock, &p, g_shared_key);
-}
-
-/* ========== MAIN ========== */
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        printf("Usage: %s <server_ip> <port>\n", argv[0]);
+    if (argc < 2) {
+        printf("Usage: %s <port>\n", argv[0]);
         exit(1);
     }
 
-    const char *ip = argv[1];
-    int port = atoi(argv[2]);
+    int port = atoi(argv[1]);
 
-    g_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_sock < 0) { perror("socket"); exit(1); }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
-
-    if (connect(g_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect");
+    // Connect to localhost
+    if (!sock.connect("127.0.0.1", port)) {
+        printf("Could not connect to localhost:%d\n", port);
         exit(1);
     }
 
-    printf("[client] Connected to %s:%d\n", ip, port);
+    // Perform DH
+    do_handshake();
 
-    if (!do_dh_handshake()) {
-        printf("[client] DH handshake failed.\n");
-        exit(1);
-    }
-
-    /* Start receiver thread */
-    pthread_t tid;
-    pthread_create(&tid, NULL, recv_thread, NULL);
-    pthread_detach(tid);
-
-    /* Main menu loop */
-    while (1) {
-        printf("\n===== Secure Notes Menu =====\n");
-        printf("1) Create Room\n");
-        printf("2) Join Room\n");
-        printf("3) Post Note\n");
-        printf("4) List Notes\n");
-        printf("5) Quit\n");
+    int choice;
+    while(1) {
+        printf("\n=== Secure Notes App ===\n");
+        if (current_room_id != -1) printf("Current Room: %d\n", current_room_id);
+        printf("1. Create Room\n");
+        printf("2. Join Room\n");
+        printf("3. Post Note\n");
+        printf("4. List Notes\n");
+        printf("5. Exit\n");
         printf("> ");
-
-        int choice;
         scanf("%d", &choice);
-        getchar();
+        getchar(); // consume newline
 
-        if (choice == 1) send_create_room();
-        else if (choice == 2) send_join_room();
-        else if (choice == 3) send_post_note();
-        else if (choice == 4) send_list_notes();
-        else if (choice == 5) {
-            send_disconnect();
-            close(g_sock);
-            exit(0);
+        Packet req, resp;
+        memset(&req, 0, sizeof(req));
+
+        if (choice == 1) {
+            req.op = OP_CREATE_ROOM;
+            send_enc(&req);
+            
+            if (recv_enc(&resp)) {
+                if (resp.op == OP_CREATE_ROOM_RESP) {
+                    current_room_id = resp.room_id;
+                    printf("Success! Room ID: %d, Invite Code: %d\n", resp.room_id, resp.tag);
+                }
+            }
         }
-        else {
-            printf("Invalid option.\n");
+        else if (choice == 2) {
+            printf("Enter Invite Code: ");
+            int code;
+            scanf("%d", &code);
+            
+            req.op = OP_JOIN_ROOM;
+            req.tag = code;
+            send_enc(&req);
+            
+            if (recv_enc(&resp)) {
+                if (resp.op == OP_JOIN_ROOM_RESP) {
+                    current_room_id = resp.room_id;
+                    printf("Joined Room %d successfully.\n", resp.room_id);
+                } else {
+                    printf("Error: %s\n", resp.message);
+                }
+            }
+        }
+        else if (choice == 3) {
+            if (current_room_id == -1) {
+                printf("You must join a room first.\n");
+                continue;
+            }
+            printf("Enter Note: ");
+            char buffer[MSG_SIZE];
+            fgets(buffer, MSG_SIZE, stdin);
+            buffer[strcspn(buffer, "\n")] = 0; // remove newline
+
+            req.op = OP_POST_NOTE;
+            req.room_id = current_room_id;
+            strncpy(req.message, buffer, MSG_SIZE);
+            send_enc(&req);
+            printf("Note sent.\n");
+        }
+        else if (choice == 4) {
+            if (current_room_id == -1) {
+                printf("You must join a room first.\n");
+                continue;
+            }
+            req.op = OP_LIST_NOTES;
+            req.room_id = current_room_id;
+            send_enc(&req);
+
+            printf("\n--- Room Notes ---\n");
+            while(1) {
+                if (!recv_enc(&resp)) break;
+                if (resp.tag == 0) break; // End of list
+                printf("[%d] %s\n", resp.tag, resp.message);
+            }
+            printf("------------------\n");
+        }
+        else if (choice == 5) {
+            break;
         }
     }
-
+    
+    sock.close();
     return 0;
 }
