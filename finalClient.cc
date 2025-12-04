@@ -1,9 +1,9 @@
-// finalClient.cc
-
-/*
- * client.c
- * SecureCollabNotes Client (Modular Version)
+/* finalClient.cc
  *
+ * SecureCollabNotes Client
+ * Refactored to match relay client structure.
+ *
+ * Usage: finalClient <ip> <port>
  */
 
 #include <stdio.h>
@@ -11,33 +11,76 @@
 #include <string.h>
 #include <unistd.h>
 #include <iostream>
+
 #include "socket.h"
 #include "finalPacket.h"
 #include "diffieHellman.h"
 #include "xor.h"
 
-// Global Socket Wrapper
-Socket sock;
+// --- Global Variables ---
+
+Socket clientSocket;
 unsigned long long shared_key = 0;
 int current_room_id = -1;
 
-// Helper: Send Encrypted
-void send_enc(Packet *p) {
-    Packet tmp;
-    memcpy(&tmp, p, sizeof(Packet));
-    xor_buffer(tmp.message, MSG_SIZE, shared_key);
-    sock.send(&tmp, sizeof(Packet));
+// --- Function Prototypes ---
+
+char *getServerInfo(int argc, char *argv[], int *port);
+void connectToServer(char *server, int port);
+void doHandshake();
+void processMessages(); // Main application loop
+void closeConnection();
+
+// Helpers
+void send_enc(Packet *p);
+bool recv_enc(Packet *p);
+
+
+// --- Main Function ---
+
+int main(int argc, char *argv[]) {
+    char *serverIP;
+    int port;
+
+    // 1. Get Info
+    serverIP = getServerInfo(argc, argv, &port);
+
+    // 2. Connect
+    connectToServer(serverIP, port);
+
+    // 3. Security Handshake
+    doHandshake();
+
+    // 4. Run App
+    processMessages();
+
+    // 5. Cleanup
+    closeConnection();
+
+    return 0;
 }
 
-// Helper: Receive Encrypted (Blocking)
-bool recv_enc(Packet *p) {
-    int n = sock.recv(p, sizeof(Packet));
-    if (n <= 0) return false;
-    xor_buffer(p->message, MSG_SIZE, shared_key);
-    return true;
+
+// --- Core Functions ---
+
+char *getServerInfo(int argc, char *argv[], int *port) {
+    if (argc < 3) {
+        printf("Usage: %s <ip> <port>\n", argv[0]);
+        exit(1);
+    }
+    *port = atoi(argv[2]);
+    return argv[1];
 }
 
-void do_handshake() {
+void connectToServer(char *server, int port) {
+    printf("[Client] Connecting to %s:%d...\n", server, port);
+    if (!clientSocket.connect(server, port)) {
+        printf("Error: Could not connect to server.\n");
+        exit(1);
+    }
+}
+
+void doHandshake() {
     unsigned long long priv = dh_generate_private();
     unsigned long long pub = dh_compute_public(priv);
 
@@ -46,59 +89,49 @@ void do_handshake() {
     p.op = OP_DH_PUB;
     sprintf(p.message, "%llu", pub);
     
-    // Send public key (unencrypted)
-    sock.send(&p, sizeof(Packet));
+    // Send public key
+    clientSocket.send(&p, sizeof(Packet));
 
-    // Wait for server response
+    // Wait for response
     Packet resp;
-    int n = sock.recv(&resp, sizeof(Packet));
-    if (n <= 0) {
-        printf("Server disconnected during handshake.\n");
+    int n = clientSocket.recv(&resp, sizeof(Packet));
+    
+    if (n > 0) {
+        unsigned long long server_pub = strtoull(resp.message, NULL, 10);
+        shared_key = dh_compute_shared(server_pub, priv);
+        printf("[Client] Secure Connection Established.\n");
+    } else {
+        printf("[Client] Handshake Failed.\n");
         exit(1);
     }
-    
-    unsigned long long server_pub = strtoull(resp.message, NULL, 10);
-    shared_key = dh_compute_shared(server_pub, priv);
-    
-    printf("[Client] Secure Connection Established. Key: %llu\n", shared_key);
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        printf("Usage: %s <ip> <port>\n", argv[0]);
-        exit(1);
-    }
-
-    const char *ip = argv[1];
-    int port = atoi(argv[2]);
-
-    printf("[Client] Connecting to %s:%d...\n", ip, port);
-
-    // Connect using provided IP and Port
-    if (!sock.connect(ip, port)) {
-        printf("Could not connect to %s:%d\n", ip, port);
-        exit(1);
-    }
-
-    // Perform DH
-    do_handshake();
-
-    int choice;
-    while(1) {
-        printf("\n=== Secure Notes App ===\n");
-        if (current_room_id != -1) printf("Current Room: %d\n", current_room_id);
+void processMessages() {
+    bool running = true;
+    while (running) {
+        printf("\n=== Secure Notes Menu ===\n");
+        if (current_room_id != -1) printf("Room: %d\n", current_room_id);
         printf("1. Create Room\n");
         printf("2. Join Room\n");
         printf("3. Post Note\n");
         printf("4. List Notes\n");
         printf("5. Exit\n");
         printf("> ");
-        scanf("%d", &choice);
+        
+        int choice;
+        // Basic input check
+        if (scanf("%d", &choice) != 1) {
+            // clear invalid input
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF);
+            continue;
+        }
         getchar(); // consume newline
 
         Packet req, resp;
         memset(&req, 0, sizeof(req));
 
+        // IF/ELSE chain (No break statements used for logic flow)
         if (choice == 1) {
             req.op = OP_CREATE_ROOM;
             send_enc(&req);
@@ -129,43 +162,66 @@ int main(int argc, char *argv[]) {
             }
         }
         else if (choice == 3) {
-            if (current_room_id == -1) {
-                printf("You must join a room first.\n");
-                continue;
-            }
-            printf("Enter Note: ");
-            char buffer[MSG_SIZE];
-            fgets(buffer, MSG_SIZE, stdin);
-            buffer[strcspn(buffer, "\n")] = 0; // remove newline
+            if (current_room_id != -1) {
+                printf("Enter Note: ");
+                char buffer[MSG_SIZE];
+                fgets(buffer, MSG_SIZE, stdin);
+                buffer[strcspn(buffer, "\n")] = 0; 
 
-            req.op = OP_POST_NOTE;
-            req.room_id = current_room_id;
-            strncpy(req.message, buffer, MSG_SIZE);
-            send_enc(&req);
-            printf("Note sent.\n");
+                req.op = OP_POST_NOTE;
+                req.room_id = current_room_id;
+                strncpy(req.message, buffer, MSG_SIZE);
+                send_enc(&req);
+                printf("Note sent.\n");
+            } else {
+                printf("Join a room first.\n");
+            }
         }
         else if (choice == 4) {
-            if (current_room_id == -1) {
-                printf("You must join a room first.\n");
-                continue;
-            }
-            req.op = OP_LIST_NOTES;
-            req.room_id = current_room_id;
-            send_enc(&req);
+            if (current_room_id != -1) {
+                req.op = OP_LIST_NOTES;
+                req.room_id = current_room_id;
+                send_enc(&req);
 
-            printf("\n--- Room Notes ---\n");
-            while(1) {
-                if (!recv_enc(&resp)) break;
-                if (resp.tag == 0) break; // End of list
-                printf("[%d] %s\n", resp.tag, resp.message);
+                printf("\n--- Room Notes ---\n");
+                bool reading = true;
+                while (reading) {
+                    if (!recv_enc(&resp)) {
+                        reading = false;
+                    } else if (resp.tag == 0) {
+                        reading = false; // End marker
+                    } else {
+                        printf("[%d] %s\n", resp.tag, resp.message);
+                    }
+                }
+                printf("------------------\n");
+            } else {
+                printf("Join a room first.\n");
             }
-            printf("------------------\n");
         }
         else if (choice == 5) {
-            break;
+            running = false;
         }
     }
-    
-    sock.close();
-    return 0;
+}
+
+void closeConnection() {
+    clientSocket.close();
+    printf("Connection closed.\n");
+}
+
+// --- Helper Functions ---
+
+void send_enc(Packet *p) {
+    Packet tmp;
+    memcpy(&tmp, p, sizeof(Packet));
+    xor_buffer(tmp.message, MSG_SIZE, shared_key);
+    clientSocket.send(&tmp, sizeof(Packet));
+}
+
+bool recv_enc(Packet *p) {
+    int n = clientSocket.recv(p, sizeof(Packet));
+    if (n <= 0) return false;
+    xor_buffer(p->message, MSG_SIZE, shared_key);
+    return true;
 }
