@@ -1,8 +1,9 @@
-// finalServer.cc
-
-/*
- * server.c
- * SecureCollabNotes Server (Modular Version)
+/* finalServer.cc
+ *
+ * SecureCollabNotes Server
+ * Refactored to match relay server structure.
+ *
+ * Usage: finalServer [port]
  */
 
 #include <stdio.h>
@@ -19,7 +20,8 @@
 #include "selector.h"
 
 // Maximum number of concurrent connections
-#define MAX_CLIENTS 1024
+const int MAX_CLIENTS = 1024;
+const int DEFAULT_PORT = 30000;
 
 // --- Data Structures ---
 
@@ -45,13 +47,239 @@ struct ClientContext {
     int current_room_id; 
 };
 
-// --- Global State ---
+// --- Function Prototypes ---
+
+int getPortNumber(int argc, char *argv[]);
+void initServerSocket(int portNum);
+void initSelector();
+void processRequests();
+void handleClientConnection();
+void handleClientRequest(int fd);
+void disconnectClient(int fd);
+
+// Logic Helpers
+Room* create_room();
+Room* find_room_by_id(int id);
+Room* find_room_by_invite(int code);
+void add_note(Room *r, const char *content);
+bool send_packet_enc(Socket *sock, Packet *p, unsigned long long key);
+
+
+// --- Global Variables ---
+
+ServerSocket theServer;
+InputSelector inputSet;
 
 ClientContext *client_list[MAX_CLIENTS]; 
 Room *room_list_head = NULL;
 int next_room_id = 1;
 
-// --- Helper Functions ---
+
+// --- Main Function ---
+
+int main(int argc, char *argv[]) {
+    srand(time(NULL));
+
+    // 1. Get Port
+    int port = getPortNumber(argc, argv);
+
+    // 2. Initialize Server Socket
+    initServerSocket(port);
+
+    // 3. Initialize Selector
+    initSelector();
+
+    // 4. Enter Main Loop
+    processRequests();
+
+    return 0;
+}
+
+
+// --- Core Functions ---
+
+int getPortNumber(int argc, char *argv[]) {
+    if (argc > 1) {
+        return atoi(argv[1]);
+    }
+    return DEFAULT_PORT;
+}
+
+void initServerSocket(int portNum) {
+    if (!theServer.bind(portNum)) {
+        printf("Error: Could not bind to port %d\n", portNum);
+        exit(1);
+    }
+    printf("[Server] Listening on port %d...\n", portNum);
+}
+
+void initSelector() {
+    // Hack to get FD from ServerSocket (assuming first member is int)
+    int fd = *(int*)&theServer;
+    inputSet.add(fd);
+}
+
+void processRequests() {
+    bool running = true;
+    while (running) {
+        int *active_fds = inputSet.select();
+        
+        // If select returns NULL, we just continue
+        if (active_fds != NULL) {
+            int i = 0;
+            // Iterate using a flag instead of break
+            bool more_fds = true;
+            
+            while (more_fds) {
+                int fd = active_fds[i];
+                
+                if (fd == -1) {
+                    more_fds = false;
+                } else {
+                    // Check if it's the listener or a client
+                    int listen_fd = *(int*)&theServer;
+                    
+                    if (fd == listen_fd) {
+                        handleClientConnection();
+                    } else {
+                        handleClientRequest(fd);
+                    }
+                    i++;
+                }
+            }
+            delete [] active_fds; // select() allocates memory
+        }
+    }
+}
+
+void handleClientConnection() {
+    Socket *new_sock = theServer.accept();
+    if (new_sock != NULL) {
+        int new_fd = *(int*)new_sock;
+        
+        if (new_fd < MAX_CLIENTS && new_fd > 0) {
+            inputSet.add(new_fd);
+            
+            // Allocate context
+            ClientContext *ctx = new ClientContext;
+            ctx->sock = new_sock;
+            ctx->dh_completed = false;
+            ctx->shared_key = 0;
+            ctx->current_room_id = -1;
+            
+            client_list[new_fd] = ctx;
+            printf("[Server] New connection (fd: %d)\n", new_fd);
+        } else {
+            printf("[Server] Connection rejected (Max clients)\n");
+            new_sock->close();
+            delete new_sock;
+        }
+    }
+}
+
+void handleClientRequest(int fd) {
+    ClientContext *ctx = client_list[fd];
+    
+    if (ctx != NULL) {
+        Packet req;
+        int n = ctx->sock->recv(&req, sizeof(Packet));
+
+        if (n <= 0) {
+            disconnectClient(fd);
+        } else {
+            // Process Logic using If/Else chains (No Switch/Break)
+            
+            // --- 1. DH Handshake ---
+            if (req.op == OP_DH_PUB) {
+                unsigned long long client_pub = strtoull(req.message, NULL, 10);
+                unsigned long long my_priv = dh_generate_private();
+                unsigned long long my_pub = dh_compute_public(my_priv);
+                ctx->shared_key = dh_compute_shared(client_pub, my_priv);
+                ctx->dh_completed = true;
+
+                Packet resp;
+                memset(&resp, 0, sizeof(resp));
+                resp.op = OP_DH_PUB;
+                sprintf(resp.message, "%llu", my_pub);
+                
+                ctx->sock->send(&resp, sizeof(Packet));
+                printf("[Server] Handshake fd: %d\n", fd);
+            }
+            // --- 2. Encrypted Operations ---
+            else if (ctx->dh_completed) {
+                // Decrypt
+                xor_buffer(req.message, MSG_SIZE, ctx->shared_key);
+                
+                Packet resp;
+                memset(&resp, 0, sizeof(resp));
+
+                if (req.op == OP_CREATE_ROOM) {
+                    Room *r = create_room();
+                    ctx->current_room_id = r->id;
+                    resp.op = OP_CREATE_ROOM_RESP;
+                    resp.room_id = r->id;
+                    resp.tag = r->invite_code;
+                    snprintf(resp.message, MSG_SIZE, "Room Created");
+                    send_packet_enc(ctx->sock, &resp, ctx->shared_key);
+                    printf("[Server] Room %d created\n", r->id);
+                }
+                else if (req.op == OP_JOIN_ROOM) {
+                    Room *r = find_room_by_invite(req.tag);
+                    if (r != NULL) {
+                        ctx->current_room_id = r->id;
+                        resp.op = OP_JOIN_ROOM_RESP;
+                        resp.room_id = r->id;
+                        snprintf(resp.message, MSG_SIZE, "Joined Room");
+                    } else {
+                        resp.op = OP_ERROR;
+                        snprintf(resp.message, MSG_SIZE, "Invalid Code");
+                    }
+                    send_packet_enc(ctx->sock, &resp, ctx->shared_key);
+                }
+                else if (req.op == OP_POST_NOTE) {
+                    Room *r = find_room_by_id(ctx->current_room_id);
+                    if (r != NULL) {
+                        add_note(r, req.message);
+                        printf("[Server] Note in Room %d\n", r->id);
+                    }
+                }
+                else if (req.op == OP_LIST_NOTES) {
+                    Room *r = find_room_by_id(ctx->current_room_id);
+                    if (r != NULL) {
+                        Note *cur = r->notes;
+                        while (cur != NULL) {
+                            Packet noteP;
+                            memset(&noteP, 0, sizeof(noteP));
+                            noteP.op = OP_LIST_NOTES_RESP;
+                            noteP.tag = cur->id;
+                            memcpy(noteP.message, cur->ciphertext, MSG_SIZE);
+                            send_packet_enc(ctx->sock, &noteP, ctx->shared_key);
+                            cur = cur->next;
+                        }
+                    }
+                    Packet endP;
+                    memset(&endP, 0, sizeof(endP));
+                    endP.op = OP_LIST_NOTES_RESP;
+                    endP.tag = 0; 
+                    send_packet_enc(ctx->sock, &endP, ctx->shared_key);
+                }
+            }
+        }
+    }
+}
+
+void disconnectClient(int fd) {
+    printf("[Server] Client (fd: %d) disconnected.\n", fd);
+    inputSet.remove(fd);
+    
+    if (client_list[fd] != NULL) {
+        delete client_list[fd]->sock;
+        delete client_list[fd];
+        client_list[fd] = NULL;
+    }
+}
+
+// --- Logic Helpers ---
 
 bool send_packet_enc(Socket *sock, Packet *p, unsigned long long key) {
     Packet tmp;
@@ -97,170 +325,4 @@ void add_note(Room *r, const char *content) {
     n->next = r->notes; 
     memcpy(n->ciphertext, content, MSG_SIZE); 
     r->notes = n;
-}
-
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <port>\n", argv[0]);
-        exit(1);
-    }
-
-    int port = atoi(argv[1]);
-    srand(time(NULL));
-
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        client_list[i] = NULL;
-    }
-
-    // 1. Setup Server Socket
-    ServerSocket serverSock;
-    if (!serverSock.bind(port)) {
-        printf("Failed to bind to port %d\n", port);
-        exit(1);
-    }
-    printf("[Server] Listening on port %d...\n", port);
-
-    // Attempt to access the internal file descriptor (Hack)
-    // We assume the first int member of the class is the fd.
-    int listen_fd = *(int*)&serverSock; 
-    
-    printf("[Server] Debug: Listen FD is %d\n", listen_fd);
-
-    // 2. Setup Selector
-    InputSelector selector;
-    selector.add(listen_fd);
-
-    while (1) {
-        int *active_fds = selector.select();
-        if (!active_fds) continue;
-
-        for (int i = 0; active_fds[i] != -1; i++) {
-            int fd = active_fds[i];
-
-            // === CASE A: New Connection ===
-            if (fd == listen_fd) {
-                Socket *new_sock = serverSock.accept();
-                if (new_sock) {
-                    // Hack to get new FD
-                    int new_fd = *(int*)new_sock; 
-                    
-                    if (new_fd < MAX_CLIENTS && new_fd > 0) {
-                        selector.add(new_fd);
-                        
-                        ClientContext *ctx = new ClientContext;
-                        ctx->sock = new_sock;
-                        ctx->dh_completed = false;
-                        ctx->shared_key = 0;
-                        ctx->current_room_id = -1;
-                        client_list[new_fd] = ctx;
-                        
-                        printf("[Server] New connection (fd: %d)\n", new_fd);
-                    } else {
-                        printf("[Server] Invalid FD or Too many clients\n");
-                        new_sock->close();
-                        delete new_sock;
-                    }
-                }
-            }
-            // === CASE B: Data from Client ===
-            else {
-                ClientContext *ctx = client_list[fd];
-                if (ctx == NULL) {
-                    selector.remove(fd);
-                    continue;
-                }
-
-                Packet req;
-                int n = ctx->sock->recv(&req, sizeof(Packet));
-
-                if (n <= 0) {
-                    printf("[Server] Client (fd: %d) disconnected.\n", fd);
-                    selector.remove(fd);
-                    delete ctx->sock;
-                    delete ctx;
-                    client_list[fd] = NULL;
-                } else {
-                    // 1. DH Handshake (Unencrypted)
-                    if (req.op == OP_DH_PUB) {
-                        unsigned long long client_pub = strtoull(req.message, NULL, 10);
-                        unsigned long long my_priv = dh_generate_private();
-                        unsigned long long my_pub = dh_compute_public(my_priv);
-                        ctx->shared_key = dh_compute_shared(client_pub, my_priv);
-                        ctx->dh_completed = true;
-
-                        Packet resp;
-                        memset(&resp, 0, sizeof(resp));
-                        resp.op = OP_DH_PUB;
-                        sprintf(resp.message, "%llu", my_pub);
-                        
-                        ctx->sock->send(&resp, sizeof(Packet));
-                        printf("[Server] DH Handshake complete for fd %d\n", fd);
-                    }
-                    // 2. Encrypted Commands
-                    else if (ctx->dh_completed) {
-                        xor_buffer(req.message, MSG_SIZE, ctx->shared_key);
-                        
-                        Packet resp;
-                        memset(&resp, 0, sizeof(resp));
-
-                        if (req.op == OP_CREATE_ROOM) {
-                            Room *r = create_room();
-                            ctx->current_room_id = r->id;
-                            
-                            resp.op = OP_CREATE_ROOM_RESP;
-                            resp.room_id = r->id;
-                            resp.tag = r->invite_code;
-                            snprintf(resp.message, MSG_SIZE, "Room Created!");
-                            
-                            send_packet_enc(ctx->sock, &resp, ctx->shared_key);
-                            printf("[Server] Room %d created\n", r->id);
-                        }
-                        else if (req.op == OP_JOIN_ROOM) {
-                            int code = req.tag;
-                            Room *r = find_room_by_invite(code);
-                            
-                            if (r != NULL) {
-                                ctx->current_room_id = r->id;
-                                resp.op = OP_JOIN_ROOM_RESP;
-                                resp.room_id = r->id;
-                                snprintf(resp.message, MSG_SIZE, "Joined Room %d", r->id);
-                            } else {
-                                resp.op = OP_ERROR;
-                                snprintf(resp.message, MSG_SIZE, "Invalid Invite Code");
-                            }
-                            send_packet_enc(ctx->sock, &resp, ctx->shared_key);
-                        }
-                        else if (req.op == OP_POST_NOTE) {
-                            if (ctx->current_room_id != -1) {
-                                Room *r = find_room_by_id(ctx->current_room_id);
-                                if (r) add_note(r, req.message);
-                            }
-                        }
-                        else if (req.op == OP_LIST_NOTES) {
-                            if (ctx->current_room_id != -1) {
-                                Room *r = find_room_by_id(ctx->current_room_id);
-                                if (r) {
-                                    Note *cur = r->notes;
-                                    while(cur) {
-                                        Packet noteP;
-                                        memset(&noteP, 0, sizeof(noteP));
-                                        noteP.op = OP_LIST_NOTES_RESP;
-                                        noteP.tag = cur->id;
-                                        memcpy(noteP.message, cur->ciphertext, MSG_SIZE);
-                                        send_packet_enc(ctx->sock, &noteP, ctx->shared_key);
-                                        cur = cur->next;
-                                    }
-                                }
-                                Packet endP;
-                                memset(&endP, 0, sizeof(endP));
-                                endP.op = OP_LIST_NOTES_RESP;
-                                endP.tag = 0; 
-                                send_packet_enc(ctx->sock, &endP, ctx->shared_key);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
