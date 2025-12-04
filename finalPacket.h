@@ -1,38 +1,43 @@
-// Final Project Header File
+/* finalPacket.h
+ *
+ * Defines the protocol packet structure used for the Secure Notes
+ * application.
+ */
 
-
-#ifndef FINALPACKET_H
-#define FINALPACKET_H
+#ifndef _FINALPACKET_H
+#define _FINALPACKET_H
 
 #include <stdint.h>
 
-#define MSG_SIZE 256
+const int MSG_SIZE = 256;
 
-/* Operation codes */
-enum {
-    OP_DH_PUB = 1,
+/* Operation Codes */
+const int OP_DH_PUB           = 1;
 
-    OP_CREATE_ROOM = 10,
-    OP_CREATE_ROOM_RESP = 11,
+const int OP_CREATE_ROOM      = 10;
+const int OP_CREATE_ROOM_RESP = 11;
 
-    OP_JOIN_ROOM = 12,
-    OP_JOIN_ROOM_RESP = 13,
+const int OP_JOIN_ROOM        = 12;
+const int OP_JOIN_ROOM_RESP   = 13;
 
-    OP_POST_NOTE = 20,
-    OP_LIST_NOTES = 21,
-    OP_LIST_NOTES_RESP = 22,
-    OP_ROOM_UPDATE = 23,
+const int OP_POST_NOTE        = 20;
+const int OP_LIST_NOTES       = 21;
+const int OP_LIST_NOTES_RESP  = 22;
 
-    OP_DISCONNECT = 30,
-    OP_ERROR = 40
-};
+const int OP_DISCONNECT       = 30;
+const int OP_ERROR            = 40;
 
-/* Generic packet structure used on the wire */
-typedef struct {
+/* * The packet contains:
+ * op:       The operation code (int)
+ * room_id:  The ID of the room (int)
+ * tag:      Invite code or Note ID (int)
+ * message:  The payload (char array)
+ */
+struct Packet {
     int32_t op;
     int32_t room_id;
     int32_t tag;
     char message[MSG_SIZE];
-} Packet;
+};
 
 #endif
