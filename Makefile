@@ -1,30 +1,27 @@
 all:
-	make server
-	make client
+	make finalServer
+	make finalClient
 
 # ======== Server ========
 
-server: server.o dh.o xor.o
-	g++ -o server server.o dh.o xor.o
+finalServer: finalServer.o ../tools/socket.o ../tools/selector.o diffieHellman.o xor.o
+	g++ -o finalServer finalServer.o ../tools/socket.o ../tools/selector.o diffieHellman.o xor.o
 
-server.o: server.cc packet.h dh.h xor.h
-	g++ -c server.cc
+finalServer.o: finalServer.cc finalPacket.h diffieHellman.h xor.h
+	g++ -c -I ../tools finalServer.cc
 
 # ======== Client ========
 
-client: client.o dh.o xor.o
-	g++ -o client client.o dh.o xor.o
+finalClient: finalClient.o ../tools/socket.o ../tools/selector.o diffieHellman.o xor.o
+	g++ -o finalClient finalClient.o ../tools/socket.o ../tools/selector.o diffieHellman.o xor.o
 
-client.o: client.cc packet.h dh.h xor.h
-	g++ -c client.cc
+finalClient.o: finalClient.cc finalPacket.h diffieHellman.h xor.h
+	g++ -c -I ../tools finalClient.cc
 
 # ======== Crypto Modules ========
 
-dh.o: dh.cc dh.h
-	g++ -c dh.cc
+diffieHellman.o: diffieHellman.cc diffieHellman.h
+	g++ -c diffieHellman.cc
 
 xor.o: xor.cc xor.h
 	g++ -c xor.cc
-
-clean:
-	rm -f *.o server client
